@@ -72,7 +72,7 @@ For Windows users, the MCP server configuration format is slightly different:
         "awslabs.dynamodb-mcp-server.exe"
       ],
       "env": {
-        "FASTMCP_LOG_LEVEL": "ERROR",
+        "FASTMCP_LOG_LEVEL": "ERROR"
       }
     }
   }
@@ -156,6 +156,27 @@ The tool automates the traditional manual validation process:
 - Identifies issues like incorrect key structures, missing indexes, or inefficient query patterns
 
 ### Source Database Analysis
+
+The DynamoDB MCP server includes source database integration for database analysis. The `source_db_analyzer` tool extracts schema and access patterns from your existing database to help design your DynamoDB model.
+
+**Supported Databases:**
+- MySQL / Aurora MySQL
+- PostgreSQL
+- SQL Server
+
+**Execution Modes:**
+- **Self-Service Mode**: Generate SQL queries, run them yourself, provide results (all databases)
+- **Managed Analysis**: Direct connection via AWS RDS Data API (MySQL only)
+
+We recommend running this tool against a non-production database instance.
+
+### Self-Service Mode (All Databases)
+
+Self-service mode allows you to analyze any database without AWS connectivity:
+
+1. **Generate Queries**: Tool writes SQL queries to a file
+2. **Run Queries**: You execute queries against your database
+3. **Provide Results**: Tool parses results and generates analysis
 
 The `source_db_analyzer` tool analyzes existing MySQL/Aurora databases to extract schema and access patterns for DynamoDB modeling. This is useful when migrating from relational databases.
 
