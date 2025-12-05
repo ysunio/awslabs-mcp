@@ -15,14 +15,8 @@
 """Database analyzer classes for source database analysis."""
 
 import os
-from awslabs.dynamodb_mcp_server.database_analysis_queries import (
-    get_performance_queries,
-    get_query_resource,
-    get_schema_queries,
-)
+from awslabs.dynamodb_mcp_server.db_analyzer import DatabasePlugin
 from awslabs.dynamodb_mcp_server.markdown_formatter import MarkdownFormatter
-from awslabs.mysql_mcp_server.server import DBConnection, DummyCtx
-from awslabs.mysql_mcp_server.server import run_query as mysql_query
 from datetime import datetime
 from loguru import logger
 from typing import Any, Dict, List, Tuple
@@ -119,6 +113,7 @@ class DatabaseAnalyzer:
         pattern_analysis_days: int,
         max_results: int,
         output_dir: str,
+        plugin: DatabasePlugin,
         performance_enabled: bool = True,
         skipped_queries: List[str] = None,
     ) -> Tuple[List[str], List[str]]:
@@ -131,12 +126,16 @@ class DatabaseAnalyzer:
             pattern_analysis_days: Number of days to analyze the logs for pattern analysis query
             max_results: Maximum results per query
             output_dir: Absolute directory path where the timestamped output analysis folder will be created
+            plugin: DatabasePlugin instance for getting query definitions (REQUIRED)
             performance_enabled: Whether performance schema is enabled
             skipped_queries: List of query names that were skipped during analysis
 
         Returns:
             Tuple of (saved_files, save_errors)
         """
+        if plugin is None:
+            raise ValueError('plugin parameter is required and cannot be None')
+
         saved_files = []
         save_errors = []
 
@@ -170,7 +169,7 @@ class DatabaseAnalyzer:
 
         # Use MarkdownFormatter to generate files
         try:
-            formatter = MarkdownFormatter(results, metadata, analysis_folder)
+            formatter = MarkdownFormatter(results, metadata, analysis_folder, plugin=plugin)
             generated_files, generation_errors = formatter.generate_all_files()
             saved_files = generated_files
 
@@ -219,163 +218,3 @@ class DatabaseAnalyzer:
                 filtered_patterns.append(pattern_with_rps)
 
         return filtered_patterns
-
-
-class MySQLAnalyzer(DatabaseAnalyzer):
-    """MySQL-specific database analyzer."""
-
-    # Use centralized query definitions from database_analysis_queries
-    SCHEMA_QUERIES = get_schema_queries()
-    PERFORMANCE_QUERIES = get_performance_queries()
-
-    @staticmethod
-    def is_performance_schema_enabled(result):
-        """Check if MySQL performance schema is enabled from query result."""
-        if result and len(result) > 0:
-            performance_schema_value = str(
-                result[0].get('', '0')
-            )  # Key is empty string by mysql package design, so checking only value here
-            return performance_schema_value == '1'
-        return False
-
-    def __init__(self, connection_params):
-        """Initialize MySQL analyzer with connection parameters."""
-        self.cluster_arn = connection_params['cluster_arn']
-        self.secret_arn = connection_params['secret_arn']
-        self.database = connection_params['database']
-        self.region = connection_params['region']
-        self.max_results = connection_params['max_results']
-        self.pattern_analysis_days = connection_params['pattern_analysis_days']
-
-    async def _run_query(self, sql, query_parameters=None):
-        """Internal method to run SQL queries against MySQL database."""
-        try:
-            # Create a new connection with current parameters
-            db_connection = DBConnection(
-                self.cluster_arn, self.secret_arn, self.database, self.region, True
-            )
-            # Pass connection parameter directly to mysql_query
-            result = await mysql_query(sql, DummyCtx(), db_connection, query_parameters)
-            return result
-        except Exception as e:
-            logger.error(f'MySQL query execution failed - {type(e).__name__}: {str(e)}')
-            return [{'error': f'MySQL query failed: {str(e)}'}]
-
-    async def execute_query_batch(
-        self, query_names: List[str], pattern_analysis_days: int = None
-    ) -> Tuple[Dict[str, Any], List[str]]:
-        """Execute a batch of analysis queries.
-
-        Args:
-            query_names: List of query names to execute
-            pattern_analysis_days: Optional analysis period for pattern queries
-
-        Returns:
-            Tuple of (results_dict, errors_list)
-        """
-        results = {}
-        errors = []
-
-        for query_name in query_names:
-            try:
-                # Get query with appropriate parameters
-                query = get_query_resource(
-                    query_name,
-                    max_query_results=self.max_results,
-                    target_database=self.database,
-                )
-
-                result = await self._run_query(query['sql'])
-
-                if result and isinstance(result, list) and len(result) > 0:
-                    if 'error' in result[0]:
-                        errors.append(f'{query_name}: {result[0]["error"]}')
-                    else:
-                        results[query_name] = {
-                            'description': query['description'],
-                            'data': result,
-                        }
-                else:
-                    # Handle empty results
-                    results[query_name] = {
-                        'description': query['description'],
-                        'data': [],
-                    }
-
-            except Exception as e:
-                errors.append(f'{query_name}: {str(e)}')
-
-        return results, errors
-
-    @classmethod
-    async def analyze(cls, connection_params: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute MySQL-specific analysis workflow.
-
-        Args:
-            connection_params: Dictionary of connection parameters
-
-        Returns:
-            Dictionary containing results, errors, performance schema status, and skipped queries
-        """
-        analyzer = cls(connection_params)
-
-        # Execute schema analysis
-        schema_results, schema_errors = await analyzer.execute_query_batch(cls.SCHEMA_QUERIES)
-
-        # Execute performance schema check
-        (
-            performance_schema_check_results,
-            performance_schema_check_errors,
-        ) = await analyzer.execute_query_batch(['performance_schema_check'])
-
-        performance_enabled = False
-        all_results = {**schema_results}
-        all_errors = schema_errors + performance_schema_check_errors
-        skipped_queries = []
-
-        # Check performance schema status and run pattern analysis if enabled
-        if 'performance_schema_check' in performance_schema_check_results:
-            performance_enabled = cls.is_performance_schema_enabled(
-                performance_schema_check_results['performance_schema_check']['data']
-            )
-
-            if performance_enabled:
-                # Run performance queries
-                perf_results, perf_errors = await analyzer.execute_query_batch(
-                    cls.PERFORMANCE_QUERIES
-                )
-                all_results.update(perf_results)
-                all_errors.extend(perf_errors)
-            else:
-                # Track skipped performance queries
-                skipped_queries.extend(cls.PERFORMANCE_QUERIES)
-                all_errors.append('Performance Schema disabled - skipping performance queries')
-
-        return {
-            'results': all_results,
-            'errors': all_errors,
-            'performance_enabled': performance_enabled,
-            'performance_feature': 'Performance Schema',
-            'skipped_queries': skipped_queries,
-        }
-
-
-class DatabaseAnalyzerRegistry:
-    """Registry for database-specific analyzers."""
-
-    _analyzers = {
-        'mysql': MySQLAnalyzer,
-    }
-
-    @classmethod
-    def get_analyzer(cls, source_db_type: str):
-        """Get the appropriate analyzer class for the database type."""
-        analyzer = cls._analyzers.get(source_db_type.lower())
-        if not analyzer:
-            raise ValueError(f'Unsupported database type: {source_db_type}')
-        return analyzer
-
-    @classmethod
-    def get_supported_types(cls) -> List[str]:
-        """Get list of supported database types."""
-        return list(cls._analyzers.keys())
